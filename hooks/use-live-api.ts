@@ -1,25 +1,50 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
-import { GoogleGenAI, LiveServerMessage, Modality } from '@google/genai';
+import { LiveServerMessage, Modality, Tool } from '@google/genai';
+import { getGenAI } from '@/lib/genai';
 
 export type LiveState = 'disconnected' | 'connecting' | 'connected';
 
 export interface UseLiveAPIOptions {
   systemInstruction: string;
-  tools?: any[];
+  tools?: Tool[];
   onMessage?: (message: LiveServerMessage) => void;
   onClose?: () => void;
-  onError?: (error: any) => void;
+  onError?: (error: unknown) => void;
+}
+
+// Encode a buffer to base64 in chunks to avoid O(n²) string concat and call-stack overflow.
+function encodeBase64(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  const CHUNK = 8192;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(binary);
 }
 
 export function useLiveAPI({ systemInstruction, tools, onMessage, onClose, onError }: UseLiveAPIOptions) {
   const [liveState, setLiveState] = useState<LiveState>('disconnected');
+
+  // Use refs for callbacks so they never stale-close over old values and don't
+  // cause `connect` to be recreated on every render.
+  const onMessageRef = useRef(onMessage);
+  const onCloseRef = useRef(onClose);
+  const onErrorRef = useRef(onError);
+  useEffect(() => { onMessageRef.current = onMessage; }, [onMessage]);
+  useEffect(() => { onCloseRef.current = onClose; }, [onClose]);
+  useEffect(() => { onErrorRef.current = onError; }, [onError]);
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const sessionRef = useRef<any>(null);
-  const audioContextRef = useRef<AudioContext | null>(null);
+  const liveStateRef = useRef<LiveState>('disconnected');
+
+  // Separate contexts: 16kHz for mic capture, native rate for playback.
+  const inputAudioContextRef = useRef<AudioContext | null>(null);
+  const outputAudioContextRef = useRef<AudioContext | null>(null);
   const audioStreamRef = useRef<MediaStream | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
-  const playbackQueueRef = useRef<Float32Array[]>([]);
   const nextPlayTimeRef = useRef(0);
-  const liveStateRef = useRef<LiveState>('disconnected');
 
   useEffect(() => {
     liveStateRef.current = liveState;
@@ -28,36 +53,41 @@ export function useLiveAPI({ systemInstruction, tools, onMessage, onClose, onErr
   const connect = useCallback(async () => {
     try {
       setLiveState('connecting');
-      
-      const apiKey = process.env.NEXT_PUBLIC_GEMINI_API_KEY;
-      if (!apiKey) throw new Error("Missing NEXT_PUBLIC_GEMINI_API_KEY");
-      
-      const ai = new GoogleGenAI({ apiKey });
 
-      // Setup audio context
-      audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
-      await audioContextRef.current.resume();
+      const ai = getGenAI();
 
-      // Request microphone
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: {
-        channelCount: 1,
-        sampleRate: 16000,
-      } });
+      // 16kHz input context for mic capture.
+      inputAudioContextRef.current = new (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)({ sampleRate: 16000 });
+      await inputAudioContextRef.current.resume();
+
+      // Native-rate output context for high-quality 24kHz playback.
+      outputAudioContextRef.current = new (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
+      await outputAudioContextRef.current.resume();
+
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, sampleRate: 16000 } });
       audioStreamRef.current = stream;
 
-      const source = audioContextRef.current.createMediaStreamSource(stream);
-      const processor = audioContextRef.current.createScriptProcessor(4096, 1, 1);
+      const source = inputAudioContextRef.current.createMediaStreamSource(stream);
+      // ScriptProcessorNode is deprecated but AudioWorklet requires a separate file;
+      // functional for current targets.
+      const processor = inputAudioContextRef.current.createScriptProcessor(4096, 1, 1);
       processorRef.current = processor;
-
+      // Route mic → processor → silent gain (not speakers).
+      // ScriptProcessorNode must be connected to something to fire onaudioprocess,
+      // but connecting to destination would play raw mic audio back through speakers
+      // and create a feedback loop where Gemini hears its own output.
+      const silentGain = inputAudioContextRef.current.createGain();
+      silentGain.gain.value = 0;
       source.connect(processor);
-      processor.connect(audioContextRef.current.destination);
+      processor.connect(silentGain);
+      silentGain.connect(inputAudioContextRef.current.destination);
 
       const session = await ai.live.connect({
-        model: "gemini-2.5-flash-native-audio-preview-09-2025",
+        model: 'gemini-2.5-flash-native-audio-preview-09-2025',
         config: {
           responseModalities: [Modality.AUDIO],
           speechConfig: {
-            voiceConfig: { prebuiltVoiceConfig: { voiceName: "Zephyr" } },
+            voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Zephyr' } },
           },
           outputAudioTranscription: {},
           systemInstruction,
@@ -72,43 +102,32 @@ export function useLiveAPI({ systemInstruction, tools, onMessage, onClose, onErr
               if (liveStateRef.current !== 'connected') return;
 
               const inputData = e.inputBuffer.getChannelData(0);
-              // Convert Float32Array to Int16Array
               const pcm16 = new Int16Array(inputData.length);
               for (let i = 0; i < inputData.length; i++) {
                 pcm16[i] = Math.max(-32768, Math.min(32767, inputData[i] * 32768));
               }
 
-              // Convert to base64
               const buffer = new ArrayBuffer(pcm16.length * 2);
               const view = new DataView(buffer);
               for (let i = 0; i < pcm16.length; i++) {
-                view.setInt16(i * 2, pcm16[i], true); // true for little-endian
+                view.setInt16(i * 2, pcm16[i], true);
               }
 
-              const bytes = new Uint8Array(buffer);
-              let binary = '';
-              for (let i = 0; i < bytes.byteLength; i++) {
-                binary += String.fromCharCode(bytes[i]);
-              }
-              const base64Data = btoa(binary);
-
-              if (liveStateRef.current === 'connected') {
-                session.sendRealtimeInput({
-                  media: { data: base64Data, mimeType: 'audio/pcm;rate=16000' }
-                });
-              }
+              session.sendRealtimeInput({
+                media: { data: encodeBase64(buffer), mimeType: 'audio/pcm;rate=16000' },
+              });
             };
           },
-          onmessage: (message: LiveServerMessage) => {
-            if (onMessage) onMessage(message);
 
-            // Handle audio playback
+          onmessage: (message: LiveServerMessage) => {
+            onMessageRef.current?.(message);
+
             const base64Audio = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
-            if (base64Audio) {
+            if (base64Audio && outputAudioContextRef.current) {
+              const audioCtx = outputAudioContextRef.current;
               const binaryString = atob(base64Audio);
-              const len = binaryString.length;
-              const bytes = new Uint8Array(len);
-              for (let i = 0; i < len; i++) {
+              const bytes = new Uint8Array(binaryString.length);
+              for (let i = 0; i < binaryString.length; i++) {
                 bytes[i] = binaryString.charCodeAt(i);
               }
               const int16Array = new Int16Array(bytes.buffer);
@@ -117,108 +136,87 @@ export function useLiveAPI({ systemInstruction, tools, onMessage, onClose, onErr
                 float32Array[i] = int16Array[i] / 32768.0;
               }
 
-              playbackQueueRef.current.push(float32Array);
-
-              if (audioContextRef.current) {
-                const audioCtx = audioContextRef.current;
-                if (nextPlayTimeRef.current < audioCtx.currentTime) {
-                  nextPlayTimeRef.current = audioCtx.currentTime + 0.05;
-                }
-
-                while (playbackQueueRef.current.length > 0) {
-                  const audioData = playbackQueueRef.current.shift()!;
-                  const audioBuffer = audioCtx.createBuffer(1, audioData.length, 24000); // Output is 24kHz
-                  audioBuffer.getChannelData(0).set(audioData);
-
-                  const source = audioCtx.createBufferSource();
-                  source.buffer = audioBuffer;
-                  source.connect(audioCtx.destination);
-                  source.start(nextPlayTimeRef.current);
-
-                  nextPlayTimeRef.current += audioBuffer.duration;
-                }
+              // Schedule playback. Use <= to handle exact-boundary timing.
+              if (nextPlayTimeRef.current <= audioCtx.currentTime) {
+                nextPlayTimeRef.current = audioCtx.currentTime + 0.05;
               }
+
+              const audioBuffer = audioCtx.createBuffer(1, float32Array.length, 24000);
+              audioBuffer.getChannelData(0).set(float32Array);
+
+              const bufferSource = audioCtx.createBufferSource();
+              bufferSource.buffer = audioBuffer;
+              bufferSource.connect(audioCtx.destination);
+              bufferSource.start(nextPlayTimeRef.current);
+
+              nextPlayTimeRef.current += audioBuffer.duration;
             }
 
-            if (message.serverContent?.interrupted) {
-              playbackQueueRef.current = [];
-              if (audioContextRef.current) {
-                nextPlayTimeRef.current = audioContextRef.current.currentTime || 0;
-              }
+            if (message.serverContent?.interrupted && outputAudioContextRef.current) {
+              nextPlayTimeRef.current = outputAudioContextRef.current.currentTime ?? 0;
             }
           },
+
           onclose: () => {
             liveStateRef.current = 'disconnected';
             setLiveState('disconnected');
-            if (onClose) onClose();
+            onCloseRef.current?.();
           },
-          onerror: (error) => {
-            console.error("Live API Error:", error);
+
+          onerror: (error: unknown) => {
+            console.error('Live API Error:', error);
             liveStateRef.current = 'disconnected';
             setLiveState('disconnected');
-            if (onError) onError(error);
-          }
-        }
+            onErrorRef.current?.(error);
+          },
+        },
       });
 
       sessionRef.current = session;
-
     } catch (err) {
-      console.error("Failed to connect:", err);
+      console.error('Failed to connect:', err);
       setLiveState('disconnected');
-      if (onError) onError(err);
+      onErrorRef.current?.(err);
     }
-  }, [systemInstruction, tools, onMessage, onClose, onError]);
+  // systemInstruction and tools are stable config; callbacks are handled via refs.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [systemInstruction, tools]);
 
   const disconnect = useCallback(() => {
     liveStateRef.current = 'disconnected';
     setLiveState('disconnected');
-    
-    if (processorRef.current) {
-      processorRef.current.disconnect();
-      processorRef.current = null;
-    }
-    
-    if (audioStreamRef.current) {
-      audioStreamRef.current.getTracks().forEach(track => track.stop());
-      audioStreamRef.current = null;
-    }
-    
-    if (audioContextRef.current) {
-      audioContextRef.current.close();
-      audioContextRef.current = null;
-    }
-    
-    playbackQueueRef.current = [];
+
+    processorRef.current?.disconnect();
+    processorRef.current = null;
+
+    audioStreamRef.current?.getTracks().forEach(track => track.stop());
+    audioStreamRef.current = null;
+
+    inputAudioContextRef.current?.close();
+    inputAudioContextRef.current = null;
+
+    outputAudioContextRef.current?.close();
+    outputAudioContextRef.current = null;
+
     nextPlayTimeRef.current = 0;
-    
+
     if (sessionRef.current) {
-      try {
-        if (sessionRef.current.close) sessionRef.current.close();
-      } catch (e) {}
+      try { sessionRef.current.close?.(); } catch { /* ignore */ }
       sessionRef.current = null;
     }
   }, []);
 
   const sendImage = useCallback((base64Data: string, mimeType: string = 'image/jpeg') => {
     if (sessionRef.current && liveStateRef.current === 'connected') {
-      sessionRef.current.sendRealtimeInput({
-        media: { data: base64Data, mimeType }
-      });
+      sessionRef.current.sendRealtimeInput({ media: { data: base64Data, mimeType } });
     }
   }, []);
 
-  const sendToolResponse = useCallback((functionResponses: any[]) => {
+  const sendToolResponse = useCallback((functionResponses: unknown[]) => {
     if (sessionRef.current && liveStateRef.current === 'connected') {
       sessionRef.current.sendToolResponse({ functionResponses });
     }
   }, []);
 
-  return {
-    liveState,
-    connect,
-    disconnect,
-    sendImage,
-    sendToolResponse
-  };
+  return { liveState, connect, disconnect, sendImage, sendToolResponse };
 }

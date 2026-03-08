@@ -2,7 +2,7 @@
 
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { useLiveAPI } from '@/hooks/use-live-api';
-import { GoogleGenAI } from '@google/genai';
+import { getGenAI } from '@/lib/genai';
 import { Camera, Mic, Play, Square, Dices, Loader2, Sparkles } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import Image from 'next/image';
@@ -14,12 +14,16 @@ import { SceneImage } from '@/components/SceneImage';
 import { LandingPage } from '@/components/LandingPage';
 import { EndRecap } from '@/components/EndRecap';
 
+const MAX_IMAGES_PER_LOCATION = 3;
+
 export default function Home() {
   const [view, setView] = useState<'landing' | 'session' | 'recap'>('landing');
   const [mounted, setMounted] = useState(false);
   const [hasApiKey, setHasApiKey] = useState(true);
   const [cameraActive, setCameraActive] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
+  // Track the live camera stream in a ref so cleanup is reliable regardless of async timing.
+  const cameraStreamRef = useRef<MediaStream | null>(null);
 
   const [worldState, setWorldState] = useState<WorldState>(initialWorldState);
   const [messages, setMessages] = useState<Message[]>([]);
@@ -27,11 +31,14 @@ export default function Home() {
   const [isGeneratingScene, setIsGeneratingScene] = useState(false);
   const [currentSceneDesc, setCurrentSceneDesc] = useState<string>('');
 
+  // Track image count via ref to avoid stale closures and race conditions.
+  const sceneImageCountRef = useRef(0);
+
   useEffect(() => {
     setMounted(true);
     const checkApiKey = async () => {
-      if (typeof window !== 'undefined' && (window as any).aistudio) {
-        const hasKey = await (window as any).aistudio.hasSelectedApiKey();
+      if (typeof window !== 'undefined' && (window as unknown as { aistudio?: { hasSelectedApiKey: () => Promise<boolean> } }).aistudio) {
+        const hasKey = await (window as unknown as { aistudio: { hasSelectedApiKey: () => Promise<boolean> } }).aistudio.hasSelectedApiKey();
         setHasApiKey(hasKey);
       }
     };
@@ -39,8 +46,8 @@ export default function Home() {
   }, []);
 
   const handleSelectKey = async () => {
-    if (typeof window !== 'undefined' && (window as any).aistudio) {
-      await (window as any).aistudio.openSelectKey();
+    if (typeof window !== 'undefined' && (window as unknown as { aistudio?: { openSelectKey: () => Promise<void> } }).aistudio) {
+      await (window as unknown as { aistudio: { openSelectKey: () => Promise<void> } }).aistudio.openSelectKey();
       setHasApiKey(true);
     }
   };
@@ -48,61 +55,70 @@ export default function Home() {
   const startCamera = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' } });
+      cameraStreamRef.current = stream;
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
         setCameraActive(true);
       }
     } catch (err) {
       console.error('Failed to access camera:', err);
+      setCameraActive(false);
     }
   };
 
+  const stopCamera = useCallback(() => {
+    cameraStreamRef.current?.getTracks().forEach(track => track.stop());
+    cameraStreamRef.current = null;
+    setCameraActive(false);
+  }, []);
+
   useEffect(() => {
     if (view === 'session' && mounted && hasApiKey) startCamera();
-    const videoElement = videoRef.current;
-    return () => {
-      if (videoElement?.srcObject) {
-        const stream = videoElement.srcObject as MediaStream;
-        stream.getTracks().forEach(track => track.stop());
-      }
-    };
+    return () => stopCamera();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [view, mounted, hasApiKey]);
 
-  const sendToolResponseRef = useRef<((responses: any[]) => void) | null>(null);
+  const sendToolResponseRef = useRef<((responses: unknown[]) => void) | null>(null);
   const dmTurnBufferRef = useRef<string>('');
 
   const generateSceneImage = useCallback(async (description: string, tone: string) => {
-    if (sceneImages.length >= 3) return;
+    // Guard via ref so concurrent calls don't both slip through the limit.
+    if (sceneImageCountRef.current >= MAX_IMAGES_PER_LOCATION) return;
+    sceneImageCountRef.current += 1;
+
     setIsGeneratingScene(true);
     setCurrentSceneDesc(description);
 
     const attemptGenerate = async (retryCount = 0): Promise<void> => {
       try {
-        const apiKey = process.env.NEXT_PUBLIC_GEMINI_API_KEY;
-        if (!apiKey) throw new Error('Missing API Key');
-        const ai = new GoogleGenAI({ apiKey });
+        const ai = getGenAI();
         const prompt = `A highly detailed, cinematic fantasy illustration. ${description}. Tone: ${tone}. Masterpiece, trending on artstation, 8k.`;
         const response = await ai.models.generateContent({
           model: 'gemini-3.1-flash-image-preview',
           contents: { parts: [{ text: prompt }] },
-          config: { imageConfig: { aspectRatio: '16:9', imageSize: '1K' } }
+          config: { imageConfig: { aspectRatio: '16:9', imageSize: '1K' } },
         });
-        for (const part of response.candidates?.[0]?.content?.parts || []) {
+        let found = false;
+        for (const part of response.candidates?.[0]?.content?.parts ?? []) {
           if (part.inlineData) {
             setSceneImages(prev => [...prev, `data:image/png;base64,${part.inlineData!.data}`]);
+            found = true;
             break;
           }
         }
-      } catch (error: any) {
-        const status = error?.status ?? error?.error?.code;
+        // If no image returned, release the slot so a retry can fill it.
+        if (!found) sceneImageCountRef.current -= 1;
+      } catch (error: unknown) {
+        const status = (error as { status?: number; error?: { code?: number } })?.status
+          ?? (error as { error?: { code?: number } })?.error?.code;
         if (status === 429 && retryCount < 2) {
-          // Parse suggested retry delay from error, default to 35s
           const retryAfterMatch = JSON.stringify(error).match(/"retryDelay"\s*:\s*"(\d+)s"/);
-          const delayMs = retryAfterMatch ? parseInt(retryAfterMatch[1]) * 1000 : 35000;
+          const delayMs = retryAfterMatch?.[1] ? parseInt(retryAfterMatch[1]) * 1000 : 35000;
           await new Promise(res => setTimeout(res, delayMs));
           return attemptGenerate(retryCount + 1);
         }
         console.error('Failed to generate scene image:', error);
+        sceneImageCountRef.current -= 1;
       }
     };
 
@@ -111,36 +127,48 @@ export default function Home() {
     } finally {
       setIsGeneratingScene(false);
     }
-  }, [sceneImages.length]);
+  }, []);
 
-  const handleMessage = useCallback(async (message: any) => {
-    if (message.serverContent?.outputTranscription?.text) {
-      dmTurnBufferRef.current += message.serverContent.outputTranscription.text;
+  const handleMessage = useCallback(async (message: unknown) => {
+    const msg = message as {
+      serverContent?: {
+        outputTranscription?: { text?: string };
+        turnComplete?: boolean;
+        interrupted?: boolean;
+      };
+      toolCall?: { functionCalls?: { id: string; name: string; args: Record<string, unknown> }[] };
+    };
+
+    if (msg.serverContent?.outputTranscription?.text) {
+      dmTurnBufferRef.current += msg.serverContent.outputTranscription.text;
     }
-    if (message.serverContent?.turnComplete && dmTurnBufferRef.current.trim()) {
+    if (msg.serverContent?.turnComplete && dmTurnBufferRef.current.trim()) {
       setMessages(prev => [...prev, { role: 'DM', text: dmTurnBufferRef.current.trim(), timestamp: Date.now() }]);
       dmTurnBufferRef.current = '';
     }
-    if (message.toolCall) {
-      const functionCalls = message.toolCall.functionCalls;
-      if (functionCalls) {
-        const responses: any[] = [];
-        for (const call of functionCalls) {
-          if (call.name === 'update_world_state') {
-            setWorldState(prev => {
-              if (call.args.currentLocation && call.args.currentLocation !== prev.currentLocation) setSceneImages([]);
-              return { ...prev, ...call.args };
-            });
-            responses.push({ id: call.id, name: call.name, response: { result: 'State updated successfully.' } });
-          } else if (call.name === 'resolve_skill_check') {
-            setWorldState(prev => ({ ...prev, lastCheckResult: call.args.outcome }));
-            responses.push({ id: call.id, name: call.name, response: { result: 'Check resolved.' } });
-          } else if (call.name === 'trigger_visual_scene') {
-            generateSceneImage(call.args.description, call.args.tone);
-            responses.push({ id: call.id, name: call.name, response: { result: 'Visual scene triggered.' } });
-          }
+
+    if (msg.toolCall?.functionCalls) {
+      const responses: unknown[] = [];
+      for (const call of msg.toolCall.functionCalls) {
+        if (call.name === 'update_world_state') {
+          setWorldState(prev => {
+            if (call.args.currentLocation && call.args.currentLocation !== prev.currentLocation) {
+              sceneImageCountRef.current = 0;
+              setSceneImages([]);
+            }
+            return { ...prev, ...call.args } as WorldState;
+          });
+          responses.push({ id: call.id, name: call.name, response: { result: 'State updated successfully.' } });
+        } else if (call.name === 'resolve_skill_check') {
+          setWorldState(prev => ({ ...prev, lastCheckResult: call.args.outcome as string }));
+          responses.push({ id: call.id, name: call.name, response: { result: 'Check resolved.' } });
+        } else if (call.name === 'trigger_visual_scene') {
+          generateSceneImage(call.args.description as string, call.args.tone as string);
+          responses.push({ id: call.id, name: call.name, response: { result: 'Visual scene triggered.' } });
         }
-        if (sendToolResponseRef.current && responses.length > 0) sendToolResponseRef.current(responses);
+      }
+      if (sendToolResponseRef.current && responses.length > 0) {
+        sendToolResponseRef.current(responses);
       }
     }
   }, [generateSceneImage]);
@@ -151,10 +179,12 @@ export default function Home() {
     onMessage: handleMessage,
   });
 
-  useEffect(() => { sendToolResponseRef.current = sendToolResponse; }, [sendToolResponse]);
+  // Keep ref in sync with the stable sendToolResponse from the hook.
+  sendToolResponseRef.current = sendToolResponse;
 
   const handleRollDice = () => {
     if (!videoRef.current || liveState !== 'connected') return;
+    if (videoRef.current.videoWidth === 0) return; // camera not ready yet
     const canvas = document.createElement('canvas');
     canvas.width = videoRef.current.videoWidth;
     canvas.height = videoRef.current.videoHeight;
@@ -167,8 +197,22 @@ export default function Home() {
   };
 
   const handleStartSession = () => setView('session');
-  const handleEndSession = () => { disconnect(); setView('recap'); };
-  const handleRestart = () => { setWorldState(initialWorldState); setMessages([]); setSceneImages([]); setView('landing'); };
+
+  const handleEndSession = () => {
+    disconnect();
+    stopCamera();
+    setView('recap');
+  };
+
+  const handleRestart = () => {
+    disconnect();
+    stopCamera();
+    sceneImageCountRef.current = 0;
+    setWorldState(initialWorldState);
+    setMessages([]);
+    setSceneImages([]);
+    setView('landing');
+  };
 
   if (!mounted) return null;
 
@@ -207,12 +251,10 @@ export default function Home() {
     <div className="min-h-screen dnd-bg text-parchment-200 flex flex-col">
       {/* ── Header ──────────────────────────────────────────── */}
       <header className="dnd-panel border-x-0 border-t-0 sticky top-0 z-50 px-6 py-3 flex items-center justify-between">
-        {/* Torch glow corners on header */}
         <div className="absolute top-0 left-0 w-24 h-full bg-amber-900/8 pointer-events-none" />
         <div className="absolute top-0 right-0 w-24 h-full bg-amber-900/8 pointer-events-none" />
 
         <div className="flex items-center gap-4 relative z-10">
-          {/* Emblem */}
           <div className="w-10 h-10 border border-gold-600/50 bg-stone-900/80 flex items-center justify-center dnd-glow-gold shrink-0">
             <span className="text-lg text-gold-400 leading-none">⚔</span>
           </div>
@@ -227,7 +269,6 @@ export default function Home() {
         </div>
 
         <div className="flex items-center gap-4 relative z-10">
-          {/* Connection status */}
           <div className="flex items-center gap-2 px-3 py-1.5 dnd-panel-inset border border-gold-700/20">
             <div className={`w-2 h-2 rounded-full ${
               liveState === 'connected'
@@ -261,26 +302,20 @@ export default function Home() {
 
       {/* ── Main Grid ───────────────────────────────────────── */}
       <main className="flex-1 p-5 grid grid-cols-1 lg:grid-cols-12 gap-5 max-w-[1800px] mx-auto w-full overflow-hidden">
-        {/* Left: World State */}
         <div className="lg:col-span-3 flex flex-col gap-5 h-[calc(100vh-8rem)]">
           <StatePanel state={worldState} />
         </div>
 
-        {/* Center: Stage & Visuals */}
         <div className="lg:col-span-6 flex flex-col gap-5 h-[calc(100vh-8rem)]">
           <SceneImage images={sceneImages} isGenerating={isGeneratingScene} description={currentSceneDesc} />
 
-          {/* Control Stage */}
           <div className="flex-1 dnd-panel flex flex-col items-center justify-center text-center gap-6 p-6 relative overflow-hidden">
-            {/* Subtle ambient glow */}
             <div className="absolute inset-0 pointer-events-none opacity-5">
               <div className="absolute top-0 left-0 w-full h-full bg-[radial-gradient(ellipse_at_center,_rgba(201,162,39,0.4)_0%,_transparent_70%)]" />
             </div>
 
-            {/* Mic / listening indicator */}
             <div className="relative z-10 space-y-4">
               <div className="relative w-16 h-16 border border-gold-600/30 bg-stone-950 flex items-center justify-center mx-auto">
-                {/* Corner ornaments on indicator */}
                 <div className="absolute -top-px -left-px w-3 h-3 border-l border-t border-gold-500/50" />
                 <div className="absolute -top-px -right-px w-3 h-3 border-r border-t border-gold-500/50" />
                 <div className="absolute -bottom-px -left-px w-3 h-3 border-l border-b border-gold-500/50" />
@@ -307,7 +342,6 @@ export default function Home() {
               </div>
             </div>
 
-            {/* Action buttons */}
             <div className="grid grid-cols-2 gap-4 w-full max-w-sm relative z-10">
               <button
                 onClick={handleRollDice}
@@ -325,11 +359,9 @@ export default function Home() {
           </div>
         </div>
 
-        {/* Right: Transcript + Camera */}
         <div className="lg:col-span-3 flex flex-col gap-5 h-[calc(100vh-8rem)]">
           <Transcript messages={messages} />
 
-          {/* Camera Preview */}
           <div className="dnd-panel overflow-hidden aspect-video relative shrink-0">
             {!cameraActive && (
               <div className="absolute inset-0 flex flex-col items-center justify-center bg-stone-950/80 text-stone-600 gap-2">
@@ -351,7 +383,6 @@ export default function Home() {
                 Live Feed
               </div>
             </div>
-            {/* Frame corners */}
             <div className="absolute top-1 left-1 w-3 h-3 border-l border-t border-gold-600/30 pointer-events-none" />
             <div className="absolute top-1 right-1 w-3 h-3 border-r border-t border-gold-600/30 pointer-events-none" />
             <div className="absolute bottom-1 left-1 w-3 h-3 border-l border-b border-gold-600/30 pointer-events-none" />

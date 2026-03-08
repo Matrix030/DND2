@@ -56,7 +56,7 @@ export const SceneImage: React.FC<SceneImageProps> = ({ images, isGenerating, de
             className="absolute inset-0"
           >
             <motion.div
-              key={mainImage}
+              key={images.length}
               initial={{ opacity: 0, scale: 1.05 }}
               animate={{ opacity: 1, scale: 1 }}
               transition={{ duration: 1.2, ease: 'easeOut' }}

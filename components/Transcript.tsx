@@ -47,7 +47,7 @@ export const Transcript: React.FC<TranscriptProps> = ({ messages }) => {
           ) : (
             messages.map((msg, idx) => (
               <motion.div
-                key={msg.timestamp + idx}
+                key={idx}
                 initial={{ opacity: 0, y: 8, scale: 0.98 }}
                 animate={{ opacity: 1, y: 0, scale: 1 }}
                 transition={{ duration: 0.3 }}

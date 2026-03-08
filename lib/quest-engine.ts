@@ -31,23 +31,24 @@ export const questTools: FunctionDeclaration[] = [
     parameters: {
       type: Type.OBJECT,
       properties: {
-        playerName: { type: Type.STRING },
-        playerRole: { type: Type.STRING },
-        currentLocation: { type: Type.STRING },
-        currentObjective: { type: Type.STRING },
-        knownClues: { type: Type.ARRAY, items: { type: Type.STRING } },
-        npcs: { 
-          type: Type.ARRAY, 
-          items: { 
+        playerName: { type: Type.STRING, description: "The player's chosen character name" },
+        playerRole: { type: Type.STRING, description: "The player's class or role (e.g. Rogue, Cleric, Ranger)" },
+        currentLocation: { type: Type.STRING, description: "The current named location (e.g. 'Ruined Chapel')" },
+        currentObjective: { type: Type.STRING, description: "The active quest objective in one sentence" },
+        knownClues: { type: Type.ARRAY, items: { type: Type.STRING }, description: "Complete list of all clues discovered so far" },
+        npcs: {
+          type: Type.ARRAY,
+          description: "All NPCs the player has encountered or learned about",
+          items: {
             type: Type.OBJECT,
             properties: {
-              name: { type: Type.STRING },
-              status: { type: Type.STRING },
-              relationship: { type: Type.STRING }
+              name: { type: Type.STRING, description: "NPC's full name" },
+              status: { type: Type.STRING, description: "Current location or state (e.g. 'In Chapel', 'Fled', 'Dead')" },
+              relationship: { type: Type.STRING, description: "Relationship to player (e.g. 'Neutral', 'Ally', 'Hostile')" }
             }
-          } 
+          }
         },
-        hazards: { type: Type.ARRAY, items: { type: Type.STRING } }
+        hazards: { type: Type.ARRAY, items: { type: Type.STRING }, description: "Active environmental hazards in the current area" }
       }
     }
   },

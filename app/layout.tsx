@@ -1,5 +1,6 @@
 import type {Metadata} from 'next';
 import { Playfair_Display, Cinzel, Cinzel_Decorative } from 'next/font/google';
+import { ErrorBoundary } from '@/components/ErrorBoundary';
 import './globals.css';
 
 const playfair = Playfair_Display({
@@ -28,7 +29,9 @@ export default function RootLayout({children}: {children: React.ReactNode}) {
   return (
     <html lang="en" className={`${playfair.variable} ${cinzel.variable} ${cinzelDeco.variable}`}>
       <body suppressHydrationWarning className="antialiased dnd-bg text-parchment-200 font-serif min-h-screen">
-        {children}
+        <ErrorBoundary>
+          {children}
+        </ErrorBoundary>
       </body>
     </html>
   );
