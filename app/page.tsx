@@ -80,6 +80,7 @@ export default function Home() {
 
   const sendToolResponseRef = useRef<((responses: unknown[]) => void) | null>(null);
   const dmTurnBufferRef = useRef<string>('');
+  const playerTurnBufferRef = useRef<string>('');
 
   const generateSceneImage = useCallback(async (description: string, tone: string) => {
     // Guard via ref so concurrent calls don't both slip through the limit.
@@ -133,18 +134,28 @@ export default function Home() {
     const msg = message as {
       serverContent?: {
         outputTranscription?: { text?: string };
+        inputTranscription?: { text?: string };
         turnComplete?: boolean;
         interrupted?: boolean;
       };
       toolCall?: { functionCalls?: { id: string; name: string; args: Record<string, unknown> }[] };
     };
 
+    if (msg.serverContent?.inputTranscription?.text) {
+      playerTurnBufferRef.current += msg.serverContent.inputTranscription.text;
+    }
     if (msg.serverContent?.outputTranscription?.text) {
       dmTurnBufferRef.current += msg.serverContent.outputTranscription.text;
     }
-    if (msg.serverContent?.turnComplete && dmTurnBufferRef.current.trim()) {
-      setMessages(prev => [...prev, { role: 'DM', text: dmTurnBufferRef.current.trim(), timestamp: Date.now() }]);
-      dmTurnBufferRef.current = '';
+    if (msg.serverContent?.turnComplete) {
+      if (playerTurnBufferRef.current.trim()) {
+        setMessages(prev => [...prev, { role: 'Player', text: playerTurnBufferRef.current.trim(), timestamp: Date.now() }]);
+        playerTurnBufferRef.current = '';
+      }
+      if (dmTurnBufferRef.current.trim()) {
+        setMessages(prev => [...prev, { role: 'DM', text: dmTurnBufferRef.current.trim(), timestamp: Date.now() }]);
+        dmTurnBufferRef.current = '';
+      }
     }
 
     if (msg.toolCall?.functionCalls) {

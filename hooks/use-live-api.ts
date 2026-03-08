@@ -90,6 +90,7 @@ export function useLiveAPI({ systemInstruction, tools, onMessage, onClose, onErr
             voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Zephyr' } },
           },
           outputAudioTranscription: {},
+          inputAudioTranscription: {},
           systemInstruction,
           tools,
         },
