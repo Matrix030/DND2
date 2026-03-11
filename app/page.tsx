@@ -40,16 +40,30 @@ export default function Home() {
 
   const handleMessage = useCallback((message: unknown) => {
     const msg = message as {
-      serverContent?: { outputTranscription?: { text?: string }; turnComplete?: boolean };
+      serverContent?: {
+        outputTranscription?: { text?: string };
+        turnComplete?: boolean;
+        interrupted?: boolean;
+      };
       toolCall?: { functionCalls?: { id: string; name: string; args: Record<string, unknown> }[] };
     };
+
+    // Interrupted means the DM was cut off — discard any partial transcription.
+    if (msg.serverContent?.interrupted) {
+      dmTurnBufferRef.current = '';
+      return;
+    }
 
     if (msg.serverContent?.outputTranscription?.text) {
       dmTurnBufferRef.current += msg.serverContent.outputTranscription.text;
     }
-    if (msg.serverContent?.turnComplete && dmTurnBufferRef.current.trim()) {
-      setMessages(prev => [...prev, { role: 'DM', text: dmTurnBufferRef.current.trim(), timestamp: Date.now() }]);
+
+    if (msg.serverContent?.turnComplete) {
+      const text = dmTurnBufferRef.current.trim();
       dmTurnBufferRef.current = '';
+      if (text.length > 1) {
+        setMessages(prev => [...prev, { role: 'DM', text, timestamp: Date.now() }]);
+      }
     }
 
     const calls = msg.toolCall?.functionCalls;
