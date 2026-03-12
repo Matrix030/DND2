@@ -9,6 +9,7 @@ import { LandingPage } from '@/components/LandingPage';
 import { EndRecap } from '@/components/EndRecap';
 import { SessionView } from '@/components/SessionView';
 import { ApiKeyGate } from '@/components/ApiKeyGate';
+import { DeathScreen } from '@/components/DeathScreen';
 
 export default function Home() {
   const [view, setView] = useState<AppView>('landing');
@@ -143,7 +144,15 @@ export default function Home() {
   if (!hasApiKey) return <ApiKeyGate onSelectKey={handleSelectKey} />;
   if (view === 'landing') return <LandingPage onStart={() => setView('session')} />;
   if (view === 'recap') return <EndRecap state={worldState} onRestart={handleRestart} />;
-  if (view === 'death') return <div>death screen placeholder</div>;
+  if (view === 'death') return (
+    <DeathScreen
+      playerName={worldState.playerName}
+      playerRole={worldState.playerRole}
+      finalLocation={worldState.currentLocation}
+      inventory={worldState.inventory}
+      onRestart={handleRestart}
+    />
+  );
 
   return (
     <SessionView
